@@ -1,106 +1,113 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-import urllib.request
 import socket
 import json
+import urllib.request
 
-# --- UDP SOCKET SETUP ---
+# --- SETUP UDP SOCKET & STREAM URL ---
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# Initialize MediaPipe
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-
-def get_vector(p1, p2):
-    return np.array([p2.x - p1.x, p2.y - p1.y, p2.z - p1.z])
-
-def calculate_angle(a, b, c):
-    ba = get_vector(b, a)
-    bc = get_vector(b, c)
-    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-    return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
-
-def calculate_spread(base1, tip1, base2, tip2):
-    v1 = get_vector(base1, tip1)
-    v2 = get_vector(base2, tip2)
-    cosine_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-    return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
-
-def normalize(angle, min_angle, max_angle):
-    return float(np.clip((angle - min_angle) / (max_angle - min_angle), 0.0, 1.0))
-
 url = "http://192.168.101.30:8080/shot.jpg"
-print(f"Transmitting 16-DoF data over UDP ({UDP_IP}:{UDP_PORT})... Press 'q' to quit.")
+use_ip_cam = True
 
-with mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7) as hands:
-    while True:
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
+
+if not use_ip_cam:
+    cap = cv2.VideoCapture(0)
+
+def get_angle(v1, v2):
+    v1_u = v1 / (np.linalg.norm(v1) + 1e-6)
+    v2_u = v2 / (np.linalg.norm(v2) + 1e-6)
+    dot_product = np.clip(np.dot(v1_u, v2_u), -1.0, 1.0)
+    return float(np.arccos(dot_product))
+
+print(f"Transmitting True 19-DoF Biomechanical Angles over UDP ({UDP_IP}:{UDP_PORT})...")
+
+while True:
+    if use_ip_cam:
         try:
-            img_resp = urllib.request.urlopen(url, timeout=1.0)
-            imgnp = np.array(bytearray(img_resp.read()), dtype=np.uint8)
-            image = cv2.imdecode(imgnp, -1)
-            
-            if image is None: 
-                continue
-
-            image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
-            results = hands.process(image)
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                    lm = hand_landmarks.landmark
-
-                    # 1. BASE FLEXION
-                    t_base = 1.0 - normalize(calculate_angle(lm[0], lm[1], lm[2]), 120.0, 170.0)
-                    i_base = 1.0 - normalize(calculate_angle(lm[0], lm[5], lm[6]), 90.0, 170.0)
-                    m_base = 1.0 - normalize(calculate_angle(lm[0], lm[9], lm[10]), 90.0, 170.0)
-                    r_base = 1.0 - normalize(calculate_angle(lm[0], lm[13], lm[14]), 90.0, 170.0)
-                    p_base = 1.0 - normalize(calculate_angle(lm[0], lm[17], lm[18]), 90.0, 170.0)
-
-                    # 2. TIP CURLING
-                    t_curl = 1.0 - normalize(calculate_angle(lm[2], lm[3], lm[4]), 120.0, 170.0)
-                    i_curl = 1.0 - normalize(calculate_angle(lm[5], lm[6], lm[8]), 70.0, 170.0)
-                    m_curl = 1.0 - normalize(calculate_angle(lm[9], lm[10], lm[12]), 70.0, 170.0)
-                    r_curl = 1.0 - normalize(calculate_angle(lm[13], lm[14], lm[16]), 70.0, 170.0)
-                    p_curl = 1.0 - normalize(calculate_angle(lm[17], lm[18], lm[20]), 70.0, 170.0)
-
-                    # 3. SPREAD
-                    t_spread = normalize(calculate_spread(lm[1], lm[2], lm[9], lm[10]), 20.0, 60.0)
-                    i_spread = normalize(calculate_spread(lm[5], lm[6], lm[9], lm[10]), 5.0, 25.0)
-                    r_spread = normalize(calculate_spread(lm[13], lm[14], lm[9], lm[10]), 5.0, 25.0)
-                    p_spread = normalize(calculate_spread(lm[17], lm[18], lm[9], lm[10]), 5.0, 35.0)
-
-                    # 4. WRIST ORIENTATION
-                    wrist_to_index = get_vector(lm[0], lm[5])
-                    wrist_to_pinky = get_vector(lm[0], lm[17])
-                    palm_normal = np.cross(wrist_to_index, wrist_to_pinky)
-                    palm_normal = palm_normal / np.linalg.norm(palm_normal)
-                    
-                    wrist_pitch = normalize(palm_normal[1], -0.5, 0.5)
-                    wrist_roll = normalize(palm_normal[0], -0.5, 0.5)
-
-                    state = {
-                        "Thumb":  [round(t_base, 2), round(t_curl, 2), round(t_spread, 2)],
-                        "Index":  [round(i_base, 2), round(i_curl, 2), round(i_spread, 2)],
-                        "Middle": [round(m_base, 2), round(m_curl, 2)],
-                        "Ring":   [round(r_base, 2), round(r_curl, 2), round(r_spread, 2)],
-                        "Pinky":  [round(p_base, 2), round(p_curl, 2), round(p_spread, 2)],
-                        "Wrist":  [round(wrist_pitch, 2), round(wrist_roll, 2)]
-                    }
-                    
-                    payload = json.dumps(state).encode('utf-8')
-                    sock.sendto(payload, (UDP_IP, UDP_PORT))
-
-            cv2.imshow('MediaPipe 16-DoF Kinematics', image)
-            if cv2.waitKey(1) & 0xFF == ord('q'): 
-                break
-                
-        except Exception as e:
+            img_resp = urllib.request.urlopen(url, timeout=2.0)
+            img_np = np.array(bytearray(img_resp.read()), dtype=np.uint8)
+            frame = cv2.imdecode(img_np, -1)
+            if frame is None: continue
+        except Exception:
             continue
+    else:
+        success, frame = cap.read()
+        if not success: continue
+        frame = cv2.flip(frame, 1)
 
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
+    hand_state = {}
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            lm = np.array([[pt.x, pt.y, pt.z] for pt in hand_landmarks.landmark])
+            
+            # --- COMPUTE 19 SERVO ANGLES FROM 21 LANDMARKS ---
+            
+            # Define directional vectors for the base of each finger
+            v_idx = lm[6] - lm[5]
+            v_mid = lm[10] - lm[9]
+            v_rng = lm[14] - lm[13]
+            v_pnk = lm[18] - lm[17]
+
+            # Thumb (FIXED: Sequential bone mapping!)
+            t_abd = get_angle(lm[2] - lm[1], lm[5] - lm[0]) 
+            t_f1 = get_angle(lm[2] - lm[1], lm[3] - lm[2]) # Corrected to use lm[2]
+            t_f2 = get_angle(lm[3] - lm[2], lm[4] - lm[3])
+            
+            # Index
+            i_abd = get_angle(v_idx, v_mid)
+            i_f1 = get_angle(lm[5] - lm[0], lm[6] - lm[5])
+            i_f2 = get_angle(lm[6] - lm[5], lm[7] - lm[6])
+            i_f3 = get_angle(lm[7] - lm[6], lm[8] - lm[7])
+            
+            # Middle
+            m_abd = get_angle(v_mid, v_rng)
+            m_f1 = get_angle(lm[9] - lm[0], lm[10] - lm[9])
+            m_f2 = get_angle(lm[10] - lm[9], lm[11] - lm[10])
+            m_f3 = get_angle(lm[11] - lm[10], lm[12] - lm[11])
+            
+            # Ring
+            r_abd = get_angle(v_rng, v_mid)
+            r_f1 = get_angle(lm[13] - lm[0], lm[14] - lm[13])
+            r_f2 = get_angle(lm[14] - lm[13], lm[15] - lm[14])
+            r_f3 = get_angle(lm[15] - lm[14], lm[16] - lm[15])
+            
+            # Pinky
+            p_abd = get_angle(v_pnk, v_rng)
+            p_f1 = get_angle(lm[17] - lm[0], lm[18] - lm[17])
+            p_f2 = get_angle(lm[18] - lm[17], lm[19] - lm[18])
+            p_f3 = get_angle(lm[19] - lm[18], lm[20] - lm[19])
+            hand_state = {
+                "thumb": [t_abd, t_f1, t_f2],
+                "index": [i_abd, i_f1, i_f2, i_f3],
+                "middle": [m_abd, m_f1, m_f2, m_f3],
+                "ring": [r_abd, r_f1, r_f2, r_f3],
+                "pinky": [p_abd, p_f1, p_f2, p_f3]
+            }
+
+    try:
+        sock.sendto(json.dumps(hand_state).encode('utf-8'), (UDP_IP, UDP_PORT))
+    except Exception:
+        pass
+
+    cv2.imshow("Full 21-Joint Raw Tracker", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+if not use_ip_cam and 'cap' in locals(): cap.release()
 cv2.destroyAllWindows()
-sock.close()
